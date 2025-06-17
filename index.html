@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Audio Client</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f2f5;
+            color: #1c1e21;
+        }
+        .container {
+            background: white;
+            padding: 2rem 3rem;
+            border-radius: 12px;
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08);
+            text-align: center;
+            max-width: 400px;
+            width: 90%;
+        }
+        h1 {
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+        p {
+            color: #606770;
+            margin-bottom: 1.5rem;
+        }
+        .input-group {
+            margin-bottom: 1rem;
+        }
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+            text-align: left;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #dddfe2;
+            border-radius: 6px;
+            box-sizing: border-box;
+            font-size: 1rem;
+        }
+        #status {
+            font-weight: 600;
+            margin: 1.5rem 0;
+            padding: 0.75rem;
+            border-radius: 6px;
+            transition: all 0.3s ease;
+        }
+        .status-disconnected { background-color: #fbe3e3; color: #8a171a; }
+        .status-connecting { background-color: #fff3cd; color: #664d03; }
+        .status-connected { background-color: #d1e7dd; color: #0f5132; }
+        .status-failed { background-color: #f8d7da; color: #58151c; }
+        .buttons {
+            display: flex;
+            gap: 1rem;
+        }
+        button {
+            flex-grow: 1;
+            background-color: #1877f2;
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 600;
+            transition: background-color 0.2s;
+        }
+        button:hover { background-color: #166fe5; }
+        button:disabled { background-color: #e4e6eb; color: #bcc0c4; cursor: not-allowed; }
+        /* The actual audio player is hidden, as it's controlled by the browser */
+        #audio { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Low-Latency Audio Stream</h1>
+        <p>Uses WebRTC for crystal-clear, real-time audio.</p>
+        <div class="input-group">
+            <label for="ip">Server IP Address:</label>
+            <input type="text" id="ip" value="127.0.0.1" placeholder="e.g., 192.168.1.10">
+        </div>
+        <div id="status" class="status-disconnected">Status: Disconnected</div>
+        <div class="buttons">
+            <button id="connectBtn">Connect</button>
+            <button id="stopBtn" disabled>Disconnect</button>
+        </div>
+        <audio id="audio" autoplay></audio>
+    </div>
+
+    <script>
+        const connectBtn = document.getElementById('connectBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const ipInput = document.getElementById('ip');
+        const statusDiv = document.getElementById('status');
+        const audio = document.getElementById('audio');
+
+        let pc = null;
+        let ws = null;
+        let shouldAutoReconnect = true;
+        let reconnectTimeout = null;
+
+        function updateStatus(text, className) {
+            statusDiv.textContent = `Status: ${text}`;
+            statusDiv.className = `status-${className}`;
+        }
+
+        async function connect() {
+            const ipAddress = ipInput.value.trim();
+            if (!ipAddress) {
+                alert("Please enter the server IP address.");
+                return;
+            }
+
+            connectBtn.disabled = true;
+            ipInput.disabled = true;
+            updateStatus('Connecting...', 'connecting');
+
+            pc = new RTCPeerConnection({
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' }
+                ],
+                bundlePolicy: 'max-bundle',
+                rtcpMuxPolicy: 'require',
+                iceTransportPolicy: 'all'
+            });
+
+            pc.addTransceiver('audio', {
+                direction: 'recvonly',
+                streams: [new MediaStream()],
+            });
+
+            pc.ontrack = (event) => {
+                if (event.track.kind === 'audio') {
+                    audio.srcObject = event.streams[0];
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                switch (pc.connectionState) {
+                    case 'connected':
+                        updateStatus('Connected & Playing Audio', 'connected');
+                        stopBtn.disabled = false;
+                        break;
+                    case 'disconnected':
+                    case 'closed':
+                        updateStatus('Disconnected', 'disconnected');
+                        handleAutoReconnect();
+                        break;
+                    case 'failed':
+                        updateStatus('Connection Failed', 'failed');
+                        handleAutoReconnect();
+                        break;
+                }
+            };
+
+            ws = new WebSocket(`ws://${ipAddress}:8765`);
+
+            ws.onopen = async () => {
+                updateStatus('Signaling... Creating Offer', 'connecting');
+                let offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
+                // Patch SDP to force Opus ptime to 10ms
+                offer.sdp = offer.sdp.replace(/a=mid:audio\r\n/g, 'a=mid:audio\r\na=ptime:10\r\n');
+                await pc.setLocalDescription(offer);
+                ws.send(JSON.stringify({ sdp: offer.sdp, type: offer.type }));
+            };
+
+            ws.onmessage = async (event) => {
+                const answer = JSON.parse(event.data);
+                if (answer.type === 'answer') {
+                    await pc.setRemoteDescription(answer);
+                    updateStatus('Answer received. Establishing connection...', 'connecting');
+                }
+            };
+
+            ws.onerror = (error) => {
+                updateStatus('Signaling Error', 'failed');
+                handleAutoReconnect();
+            };
+
+            ws.onclose = () => {
+                updateStatus('Disconnected', 'disconnected');
+                handleAutoReconnect();
+            };
+        }
+
+        function stop() {
+            shouldAutoReconnect = false;
+            if (reconnectTimeout) {
+                clearTimeout(reconnectTimeout);
+                reconnectTimeout = null;
+            }
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            updateStatus('Disconnected', 'disconnected');
+            connectBtn.disabled = false;
+            stopBtn.disabled = true;
+            ipInput.disabled = false;
+            audio.srcObject = null;
+        }
+
+        function handleAutoReconnect() {
+            if (shouldAutoReconnect) {
+                if (reconnectTimeout) clearTimeout(reconnectTimeout);
+                reconnectTimeout = setTimeout(() => {
+                    stopBtn.disabled = true;
+                    connect();
+                }, 1000); // 1 second delay before reconnect
+            }
+        }
+
+        audio.addEventListener('canplay', () => {
+            audio.volume = 1.0;
+            audio.playbackRate = 1.0;
+            audio.latencyHint = 'interactive';
+            try {
+                if (audio.sinkId !== undefined) {
+                    audio.setSinkId('default').catch(e => {});
+                }
+            } catch (e) {}
+        });
+
+        connectBtn.addEventListener('click', () => {
+            shouldAutoReconnect = true;
+            connect();
+        });
+        stopBtn.addEventListener('click', stop);
+    </script>
+</body>
+</html>
